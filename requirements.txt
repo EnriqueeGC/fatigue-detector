@@ -1,0 +1,5 @@
+opencv-python
+mediapipe
+numpy
+sqlite3
+sqlalchemy
