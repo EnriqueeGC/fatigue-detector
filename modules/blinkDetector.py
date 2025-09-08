@@ -1,15 +1,10 @@
-"""
-Módulo que contiene la clase BlinkDetector, responsable de procesar
-los fotogramas de video para detectar y contar parpadeos.
-"""
-
 import cv2
 import mediapipe as mp
 import time
 
 from utils.earDetector import calculate_ear
 import config
-from app.controllers import DataController  # ¡Importamos el controlador aquí!
+from app.controllers import DataController
 
 class BlinkDetector:
     def __init__(self, data_controller: DataController):
@@ -24,7 +19,8 @@ class BlinkDetector:
         # --- Variables de estado actualizadas ---
         self.blink_counter = 0
         self.long_blink_counter = 0
-        self.blink_start_time = None  # <--- Reemplaza a frame_counter y is_eye_closed
+        self.blink_start_time = None
+        self.is_eye_closed = False # Nueva variable de estado
         
         self.data_controller = data_controller
 
@@ -32,38 +28,44 @@ class BlinkDetector:
         """
         Actualiza los contadores de parpadeo basado en el valor EAR y el TIEMPO TRANSCURRIDO.
         """
-        # --- Lógica robusta basada en tiempo ---
-
-        # Si el ojo está cerrado (EAR por debajo del umbral)
+        # --- Lógica de Detección de Parpadeo ---
         if ear_value < config.EAR_THRESHOLD:
-            # Si es la primera vez que detectamos el ojo cerrado, guardamos el tiempo de inicio.
-            if self.blink_start_time is None:
+            if not self.is_eye_closed:
+                self.is_eye_closed = True
                 self.blink_start_time = time.time()
+                
+            # --- Lógica de Alerta de Somnolencia (Nueva) ---
+            # Si los ojos llevan cerrados más de 'LONG_BLINK_DURATION_SECONDS'
+            if (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
+                # La alerta se dispara y se mantiene mientras los ojos estén cerrados
+                print("¡ALERTA DE SOMNOLENCIA! Ojos cerrados por mucho tiempo.")
+                
+                # Puedes agregar una lógica para no enviar eventos repetidos a la DB cada frame.
+                # Por ejemplo, enviar un evento solo una vez por cada período de ojos cerrados.
+                # O simplemente, este 'print' es suficiente para una alerta en tiempo real.
         
-        # Si el ojo está abierto
-        else:
-            # Y si venía de estar cerrado (tenemos un tiempo de inicio guardado)
-            if self.blink_start_time is not None:
-                # Calculamos la duración total que el ojo estuvo cerrado en segundos.
+        # --- Lógica de Conteos (Solo al abrir los ojos) ---
+        else: # Si los ojos están abiertos
+            if self.is_eye_closed: # Si venían de estar cerrados
+                self.is_eye_closed = False
                 duration = time.time() - self.blink_start_time
 
-                # 1. Comprobamos si fue un PARPADEO LARGO (fatiga)
+                # Comprobamos si fue un PARPADEO LARGO
                 if duration >= config.LONG_BLINK_DURATION_SECONDS:
                     self.long_blink_counter += 1
-                    print(f"¡Parpadeo Largo Detectado! (Duración: {duration:.2f} segundos)")
+                    print(f"Parpadeo Largo Finalizado. (Duración: {duration:.2f} s)")
                     
-                    # Registramos el evento de fatiga en la base de datos
+                    # Opcional: Registrar el evento de parpadeo largo en la DB aquí
                     self.data_controller.add_event_to_session(
-                        event_type="fatiga",
+                        event_type="parpadeo_largo",
                         description=f"Parpadeo largo detectado. Duración: {duration:.2f} s."
                     )
 
-                # 2. Si no fue largo, comprobamos si fue un PARPADEO NORMAL
+                # Si no fue largo, comprobamos si fue un PARPADEO NORMAL
                 elif config.MIN_BLINK_DURATION_SECONDS <= duration <= config.MAX_NORMAL_BLINK_DURATION_SECONDS:
                     self.blink_counter += 1
-                    print(f"Parpadeo Normal Detectado (Duración: {duration:.2f} segundos)")
+                    print(f"Parpadeo Normal Detectado (Duración: {duration:.2f} s)")
 
-                # 3. Finalmente, reseteamos el tiempo de inicio para estar listos para el próximo parpadeo.
                 self.blink_start_time = None
 
     def process_frame(self, frame):
@@ -75,26 +77,42 @@ class BlinkDetector:
         results = self.face_mesh.process(image_rgb)
 
         avg_ear = -1.0
+        
+        if not results.multi_face_landmarks:
+            self.blink_start_time = None
+            self.is_eye_closed = False # Resetea el estado si no hay cara
 
         if results.multi_face_landmarks:
             face_landmarks = results.multi_face_landmarks[0].landmark
 
-            left_eye_points = [face_landmarks[i] for i in config.LEFT_EYE_INDEXES]
-            right_eye_points = [face_landmarks[i] for i in config.RIGHT_EYE_INDEXES]
+            try:
+                left_eye_points = [face_landmarks[i] for i in config.LEFT_EYE_INDEXES]
+                right_eye_points = [face_landmarks[i] for i in config.RIGHT_EYE_INDEXES]
+                
+                left_ear = calculate_ear(left_eye_points, (height, width))
+                right_ear = calculate_ear(right_eye_points, (height, width))
+                avg_ear = (left_ear + right_ear) / 2.0
 
-            left_ear = calculate_ear(left_eye_points, (height, width))
-            right_ear = calculate_ear(right_eye_points, (height, width))
-            avg_ear = (left_ear + right_ear) / 2.0
-
-            self._update_blink_counter(avg_ear)
-            self._draw_eye_landmarks(frame, left_eye_points, right_eye_points)
+                self._update_blink_counter(avg_ear)
+                self._draw_eye_landmarks(frame, left_eye_points, right_eye_points)
+                
+            except IndexError:
+                print("No se pudieron detectar ambos ojos. La detección de parpadeo se detiene.")
+                self.blink_start_time = None
+                self.is_eye_closed = False
 
         self._draw_info(frame, avg_ear)
+        
+        # Dibujar la alerta de somnolencia si los ojos están cerrados prolongadamente
+        if self.is_eye_closed and (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
+            cv2.putText(frame, "¡ALERTA DE SOMNOLENCIA!", (50, 250), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
         return frame, self.blink_counter, self.long_blink_counter
 
     def _draw_info(self, frame, ear_value):
         """Dibuja el contador de parpadeos y el valor EAR en el fotograma."""
+        # La lógica de dibujado se mantiene igual para evitar redundancia en el ejemplo
         cv2.putText(frame, f"Parpadeos: {self.blink_counter}",
                     config.TEXT_POSITION_COUNTER,
                     getattr(cv2, config.FONT),

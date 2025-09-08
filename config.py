@@ -67,5 +67,28 @@ LONG_BLINK_DURATION_SECONDS = 1.0 # Si el ojo está cerrado por 1 segundo o más
 # Ayuda a descartar fotogramas donde la cara está muy de perfil.
 VALID_EAR_THRESHOLD = 0.05
 
-# Texto a mostrar cuando la posición del rostro no es válida para la detección.
-INVALID_POSE_TEXT = "Mire de Frente"
+# Umbral de parpadeos largos para activar la alerta fuerte
+MAX_LONG_BLINKS_FOR_STRONG_ALERT = 3
+
+# --- Detección de Bostezos ---
+# Índices de los landmarks de la boca en el modelo de MediaPipe
+# Contorno exterior completo de la boca (más robusto)
+MOUTH_INDEXES = [
+    61, 185, 40, 39, 37, 0, 267, 269, 270, 409,
+    291, 375, 321, 405, 314, 17, 84, 181, 91, 146
+]
+# También podemos incluir algunos puntos internos para calcular el MAR más preciso
+# Los puntos 13 (arriba) y 14 (abajo) pueden ser útiles para la altura
+# Los puntos 78 (izquierda) y 308 (derecha) para el ancho
+MOUTH_INDEXES_FOR_MAR_CALC = [13, 14, 78, 308] # Estos se usarán específicamente para calculate_mar
+
+YAWN_THRESHOLD = 0.5  # Umbral para considerar la boca abierta (ajustar según pruebas)
+MIN_YAWN_DURATION_SECONDS = 1.0  # Duración mínima de un bostezo para ser contado
+
+# Posiciones de texto para la visualización
+TEXT_POSITION_YAWN_COUNTER = (20, 160) # Ajustado para no sobreponerse con la alerta
+TEXT_POSITION_MAR = (20, 190) # Ajustado
+
+# Colores y tamaños para la visualización
+COLOR_YAWN_COUNTER = (0, 0, 255)  # Rojo
+COLOR_MAR = (255, 128, 0) # Naranja
