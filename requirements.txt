@@ -3,3 +3,4 @@ mediapipe
 numpy
 sqlite3
 sqlalchemy
+simpleaudio

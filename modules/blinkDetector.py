@@ -6,6 +6,8 @@ from utils.earDetector import calculate_ear
 import config
 from app.controllers import DataController
 
+from utils.beepAlert import beep_alerta
+
 class BlinkDetector:
     def __init__(self, data_controller: DataController):
         """Inicializa el detector con el modelo de MediaPipe y el controlador de DB."""
@@ -39,7 +41,8 @@ class BlinkDetector:
             if (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
                 # La alerta se dispara y se mantiene mientras los ojos estén cerrados
                 print("¡ALERTA DE SOMNOLENCIA! Ojos cerrados por mucho tiempo.")
-                
+                beep_alerta()  # pitido 0.2s a 1000Hz
+
                 # Puedes agregar una lógica para no enviar eventos repetidos a la DB cada frame.
                 # Por ejemplo, enviar un evento solo una vez por cada período de ojos cerrados.
                 # O simplemente, este 'print' es suficiente para una alerta en tiempo real.
@@ -64,24 +67,22 @@ class BlinkDetector:
                 # Si no fue largo, comprobamos si fue un PARPADEO NORMAL
                 elif config.MIN_BLINK_DURATION_SECONDS <= duration <= config.MAX_NORMAL_BLINK_DURATION_SECONDS:
                     self.blink_counter += 1
-                    print(f"Parpadeo Normal Detectado (Duración: {duration:.2f} s)")
+                    # print(f"Parpadeo Normal Detectado (Duración: {duration:.2f} s)")
 
                 self.blink_start_time = None
 
     def process_frame(self, frame):
         """
-        Procesa un único fotograma para detectar parpadeos.
+        Procesa un único fotograma para detectar parpadeos, con lógica mejorada
+        para manejar la ausencia de la cara.
         """
         height, width, _ = frame.shape
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(image_rgb)
-
+        
         avg_ear = -1.0
         
-        if not results.multi_face_landmarks:
-            self.blink_start_time = None
-            self.is_eye_closed = False # Resetea el estado si no hay cara
-
+        # Comprobamos si MediaPipe detectó una cara y sus landmarks
         if results.multi_face_landmarks:
             face_landmarks = results.multi_face_landmarks[0].landmark
 
@@ -89,22 +90,37 @@ class BlinkDetector:
                 left_eye_points = [face_landmarks[i] for i in config.LEFT_EYE_INDEXES]
                 right_eye_points = [face_landmarks[i] for i in config.RIGHT_EYE_INDEXES]
                 
-                left_ear = calculate_ear(left_eye_points, (height, width))
-                right_ear = calculate_ear(right_eye_points, (height, width))
-                avg_ear = (left_ear + right_ear) / 2.0
-
-                self._update_blink_counter(avg_ear)
-                self._draw_eye_landmarks(frame, left_eye_points, right_eye_points)
+                # Verificación adicional: Nos aseguramos de que los puntos de los ojos
+                # estén dentro de un área razonable.
+                # Aquí asumimos que los ojos estarán siempre en la parte superior de la cara.
+                if any(p.y > 0.8 for p in left_eye_points + right_eye_points):
+                    # Esto es un caso extremo, los landmarks están muy abajo,
+                    # lo que podría indicar una detección errónea.
+                    # Puedes ajustar este valor si es necesario.
+                    avg_ear = -1.0
+                else:
+                    left_ear = calculate_ear(left_eye_points, (height, width))
+                    right_ear = calculate_ear(right_eye_points, (height, width))
+                    avg_ear = (left_ear + right_ear) / 2.0
+                    self._update_blink_counter(avg_ear)
+                    self._draw_eye_landmarks(frame, left_eye_points, right_eye_points)
                 
             except IndexError:
-                print("No se pudieron detectar ambos ojos. La detección de parpadeo se detiene.")
+                # Los puntos de los ojos no se detectaron correctamente.
+                avg_ear = -1.0
                 self.blink_start_time = None
                 self.is_eye_closed = False
+                print("No se pudieron detectar ambos ojos. La detección de parpadeo se detiene.")
+
+        else: # Si no hay resultados de landmarks, no hay cara visible
+            # Reiniciar el estado para evitar detecciones falsas
+            self.blink_start_time = None
+            self.is_eye_closed = False
 
         self._draw_info(frame, avg_ear)
         
-        # Dibujar la alerta de somnolencia si los ojos están cerrados prolongadamente
-        if self.is_eye_closed and (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
+        # Dibujar la alerta de somnolencia solo si los ojos están cerrados y el tiempo excede el umbral
+        if self.is_eye_closed and self.blink_start_time and (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
             cv2.putText(frame, "¡ALERTA DE SOMNOLENCIA!", (50, 250), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
