@@ -92,3 +92,16 @@ TEXT_POSITION_MAR = (20, 190) # Ajustado
 # Colores y tamaños para la visualización
 COLOR_YAWN_COUNTER = (0, 0, 255)  # Rojo
 COLOR_MAR = (255, 128, 0) # Naranja
+
+# --- Configuración para la Alerta de Bostezos ---
+YAWN_ALERT_TIME_WINDOW = 60  # Duración de la ventana de tiempo en segundos (ej. 60s = 1 minuto)
+YAWN_ALERT_THRESHOLD = 3      # Número de bostezos en la ventana de tiempo para activar la alerta
+YAWN_ALERT_WINDOW_SIZE = YAWN_ALERT_THRESHOLD + 2 # Se recomienda que la cola sea un poco más grande que el umbral
+
+# Ventana de tiempo para el suavizado del EAR (en número de fotogramas)
+SMOOTHING_FRAMES = 8 
+
+# --- Configuración para la calibración del umbral adaptativo ---
+CALIBRATION_DURATION_SECONDS = 5.0 # Duración de la fase de calibración
+CLOSED_EYE_RATIO = 0.70            # Porcentaje del EAR de ojos abiertos para definir el umbral de cierre
+DROWSY_RATIO = 0.50                # Porcentaje del EAR de ojos abiertos para una alerta de somnolencia

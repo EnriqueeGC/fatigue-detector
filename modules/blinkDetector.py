@@ -1,6 +1,7 @@
 import cv2
 import mediapipe as mp
 import time
+import collections
 
 from utils.earDetector import calculate_ear
 import config
@@ -18,63 +19,88 @@ class BlinkDetector:
             min_tracking_confidence=config.MIN_TRACKING_CONFIDENCE
         )
         
-        # --- Variables de estado actualizadas ---
+        # --- Variables de estado del detector ---
         self.blink_counter = 0
         self.long_blink_counter = 0
         self.blink_start_time = None
-        self.is_eye_closed = False # Nueva variable de estado
-        
+        self.is_eye_closed = False
         self.data_controller = data_controller
+
+        # --- Variables para el suavizado del EAR (Media Móvil) ---
+        self.ear_history = collections.deque(maxlen=config.SMOOTHING_FRAMES)
+        self.smoothed_ear = -1.0
+
+        # --- Variables para el umbral adaptativo ---
+        self.is_calibrating = True
+        self.calibration_start_time = time.time()
+        self.ear_calibration_values = []
+        self.adaptive_ear_threshold = config.EAR_THRESHOLD # Valor por defecto hasta la calibración
+        
+        # Nuevos umbrales para mejorar la lógica
+        self.open_ear_base = None
+        self.closed_ear_threshold = None
+        self.drowsy_ear_threshold = None
+
+    def _calibrate_threshold(self, ear_value):
+        """Fase de calibración para definir el umbral adaptativo."""
+        current_time = time.time()
+        if current_time - self.calibration_start_time < config.CALIBRATION_DURATION_SECONDS:
+            # Sigue en fase de calibración
+            self.ear_calibration_values.append(ear_value)
+        else:
+            # Termina la calibración y calcula el umbral
+            if self.ear_calibration_values:
+                # Filtrar valores extremos (posibles parpadeos)
+                valid_ears = [ear for ear in self.ear_calibration_values if ear > 0]
+                if valid_ears:
+                    # Usamos el percentil 95 para evitar que parpadeos cortos afecten el promedio
+                    self.open_ear_base = sorted(valid_ears)[int(len(valid_ears) * 0.95)]
+                    
+                    # Definimos los umbrales basados en el valor base
+                    self.closed_ear_threshold = self.open_ear_base * config.CLOSED_EYE_RATIO
+                    self.drowsy_ear_threshold = self.open_ear_base * config.DROWSY_RATIO
+                    
+                    self.adaptive_ear_threshold = self.closed_ear_threshold
+                    print(f"Calibración finalizada. EAR base: {self.open_ear_base:.2f}, Umbral de cierre: {self.closed_ear_threshold:.2f}")
+                else:
+                    print("Calibración fallida: No se detectaron valores de EAR válidos.")
+            
+            self.is_calibrating = False
 
     def _update_blink_counter(self, ear_value):
         """
-        Actualiza los contadores de parpadeo basado en el valor EAR y el TIEMPO TRANSCURRIDO.
+        Actualiza los contadores de parpadeo basado en el valor EAR y el tiempo.
         """
-        # --- Lógica de Detección de Parpadeo ---
-        if ear_value < config.EAR_THRESHOLD:
+        # Se usa el umbral adaptativo
+        if ear_value < self.adaptive_ear_threshold:
             if not self.is_eye_closed:
                 self.is_eye_closed = True
                 self.blink_start_time = time.time()
                 
-            # --- Lógica de Alerta de Somnolencia (Nueva) ---
-            # Si los ojos llevan cerrados más de 'LONG_BLINK_DURATION_SECONDS'
-            if (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
-                # La alerta se dispara y se mantiene mientras los ojos estén cerrados
+            # Lógica de Alerta de Somnolencia
+            if self.blink_start_time and (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
                 print("¡ALERTA DE SOMNOLENCIA! Ojos cerrados por mucho tiempo.")
-                beep_alerta()  # pitido 0.2s a 1000Hz
-
-                # Puedes agregar una lógica para no enviar eventos repetidos a la DB cada frame.
-                # Por ejemplo, enviar un evento solo una vez por cada período de ojos cerrados.
-                # O simplemente, este 'print' es suficiente para una alerta en tiempo real.
-        
-        # --- Lógica de Conteos (Solo al abrir los ojos) ---
-        else: # Si los ojos están abiertos
-            if self.is_eye_closed: # Si venían de estar cerrados
+                beep_alerta()
+        else:
+            if self.is_eye_closed:
                 self.is_eye_closed = False
                 duration = time.time() - self.blink_start_time
 
-                # Comprobamos si fue un PARPADEO LARGO
                 if duration >= config.LONG_BLINK_DURATION_SECONDS:
                     self.long_blink_counter += 1
                     print(f"Parpadeo Largo Finalizado. (Duración: {duration:.2f} s)")
-                    
-                    # Opcional: Registrar el evento de parpadeo largo en la DB aquí
                     self.data_controller.add_event_to_session(
                         event_type="parpadeo_largo",
                         description=f"Parpadeo largo detectado. Duración: {duration:.2f} s."
                     )
-
-                # Si no fue largo, comprobamos si fue un PARPADEO NORMAL
                 elif config.MIN_BLINK_DURATION_SECONDS <= duration <= config.MAX_NORMAL_BLINK_DURATION_SECONDS:
                     self.blink_counter += 1
-                    # print(f"Parpadeo Normal Detectado (Duración: {duration:.2f} s)")
-
                 self.blink_start_time = None
 
     def process_frame(self, frame):
         """
         Procesa un único fotograma para detectar parpadeos, con lógica mejorada
-        para manejar la ausencia de la cara.
+        para manejar la ausencia de la cara y el suavizado del EAR.
         """
         height, width, _ = frame.shape
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -82,45 +108,47 @@ class BlinkDetector:
         
         avg_ear = -1.0
         
-        # Comprobamos si MediaPipe detectó una cara y sus landmarks
         if results.multi_face_landmarks:
             face_landmarks = results.multi_face_landmarks[0].landmark
-
             try:
                 left_eye_points = [face_landmarks[i] for i in config.LEFT_EYE_INDEXES]
                 right_eye_points = [face_landmarks[i] for i in config.RIGHT_EYE_INDEXES]
                 
-                # Verificación adicional: Nos aseguramos de que los puntos de los ojos
-                # estén dentro de un área razonable.
-                # Aquí asumimos que los ojos estarán siempre en la parte superior de la cara.
-                if any(p.y > 0.8 for p in left_eye_points + right_eye_points):
-                    # Esto es un caso extremo, los landmarks están muy abajo,
-                    # lo que podría indicar una detección errónea.
-                    # Puedes ajustar este valor si es necesario.
-                    avg_ear = -1.0
-                else:
+                if not any(p.y > 0.8 for p in left_eye_points + right_eye_points):
                     left_ear = calculate_ear(left_eye_points, (height, width))
                     right_ear = calculate_ear(right_eye_points, (height, width))
                     avg_ear = (left_ear + right_ear) / 2.0
-                    self._update_blink_counter(avg_ear)
-                    self._draw_eye_landmarks(frame, left_eye_points, right_eye_points)
-                
             except IndexError:
-                # Los puntos de los ojos no se detectaron correctamente.
                 avg_ear = -1.0
-                self.blink_start_time = None
-                self.is_eye_closed = False
-                print("No se pudieron detectar ambos ojos. La detección de parpadeo se detiene.")
-
-        else: # Si no hay resultados de landmarks, no hay cara visible
-            # Reiniciar el estado para evitar detecciones falsas
-            self.blink_start_time = None
-            self.is_eye_closed = False
-
-        self._draw_info(frame, avg_ear)
         
-        # Dibujar la alerta de somnolencia solo si los ojos están cerrados y el tiempo excede el umbral
-        if self.is_eye_closed and self.blink_start_time and (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
+        # Lógica de suavizado del EAR
+        if avg_ear >= 0.0:
+            self.ear_history.append(avg_ear)
+            self.smoothed_ear = sum(self.ear_history) / len(self.ear_history)
+        else:
+            self.ear_history.clear()
+            self.smoothed_ear = -1.0
+
+        # Lógica de calibración o detección
+        if self.is_calibrating:
+            if self.smoothed_ear >= 0.0:
+                self._calibrate_threshold(self.smoothed_ear)
+        else:
+            self._update_blink_counter(self.smoothed_ear)
+        
+        # Dibujado de landmarks, info y alertas
+        if results.multi_face_landmarks:
+            face_landmarks = results.multi_face_landmarks[0].landmark
+            left_eye_points = [face_landmarks[i] for i in config.LEFT_EYE_INDEXES]
+            right_eye_points = [face_landmarks[i] for i in config.RIGHT_EYE_INDEXES]
+            self._draw_eye_landmarks(frame, left_eye_points, right_eye_points)
+        
+        self._draw_info(frame, self.smoothed_ear)
+        
+        if self.is_calibrating:
+            cv2.putText(frame, "Calibrando... Mantenga los ojos abiertos", (50, 250),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+        elif self.is_eye_closed and self.blink_start_time and (time.time() - self.blink_start_time) >= config.LONG_BLINK_DURATION_SECONDS:
             cv2.putText(frame, "¡ALERTA DE SOMNOLENCIA!", (50, 250), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 

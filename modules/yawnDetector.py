@@ -1,12 +1,15 @@
 import cv2
 import mediapipe as mp
 import time
+import collections # Se necesita para una cola de tamaño fijo
 
 from utils.marDetector import calculate_mar
 import config
+from app.controllers import DataController
+from utils.beepAlert import beep_alerta
 
 class YawnDetector:
-    def __init__(self, data_controller):
+    def __init__(self, data_controller: DataController):
         """Inicializa el detector con el modelo de MediaPipe y el controlador de DB."""
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             max_num_faces=config.MAX_FACES,
@@ -20,6 +23,32 @@ class YawnDetector:
         self.detection_reliable = True
         
         self.data_controller = data_controller
+        
+        # --- Nueva lógica para la alarma de bostezos ---
+        self.yawn_timestamps = collections.deque(maxlen=config.YAWN_ALERT_WINDOW_SIZE)
+        self.alert_active = False
+
+    def _check_for_alert(self):
+        """Verifica si la cantidad de bostezos en el período de tiempo es alarmante."""
+        current_time = time.time()
+        
+        # Eliminar timestamps que están fuera de la ventana de tiempo
+        while self.yawn_timestamps and (current_time - self.yawn_timestamps[0] > config.YAWN_ALERT_TIME_WINDOW):
+            self.yawn_timestamps.popleft()
+            
+        # Comprobar si se ha alcanzado el umbral de alerta
+        if len(self.yawn_timestamps) >= config.YAWN_ALERT_THRESHOLD and not self.alert_active:
+            print("¡ALERTA DE FATIGA! Múltiples bostezos detectados.")
+            self.alert_active = True
+            beep_alerta()
+            self.data_controller.add_event_to_session(
+                event_type="alerta_bostezo",
+                description=f"Alerta de fatiga por {len(self.yawn_timestamps)} bostezos en un minuto."
+            )
+        
+        # Si el número de bostezos baja del umbral, se desactiva la alerta
+        if len(self.yawn_timestamps) < config.YAWN_ALERT_THRESHOLD:
+            self.alert_active = False
 
     def _update_yawn_counter(self, mar_value):
         """
@@ -38,7 +67,12 @@ class YawnDetector:
                         event_type="bostezo",
                         description=f"Bostezo detectado. Duración: {duration:.2f} s."
                     )
+                    # Añadir el timestamp del bostezo a la cola para la lógica de alerta
+                    self.yawn_timestamps.append(time.time())
                 self.yawn_start_time = None
+        
+        # Llamar a la función de verificación de alerta después de cada posible bostezo
+        self._check_for_alert()
 
     def process_frame(self, frame):
         """
@@ -54,25 +88,21 @@ class YawnDetector:
         if results.multi_face_landmarks:
             face_landmarks = results.multi_face_landmarks[0].landmark
 
-            # Verificar si tenemos suficientes landmarks para los cálculos
             required_indices = set(config.MOUTH_INDEXES_FOR_MAR_CALC)
-            if len(face_landmarks) > max(required_indices): # Asegura que todos los índices necesarios existen
+            if len(face_landmarks) > max(required_indices) if required_indices else 0:
                 try:
                     mar_value = calculate_mar(face_landmarks, (height, width))
                     self._update_yawn_counter(mar_value)
 
-                    # Para dibujar, usamos los índices de contorno completo
                     mouth_points_to_draw = [face_landmarks[i] for i in config.MOUTH_INDEXES]
-                    # Extraer puntos específicos para el MAR para dibujarlos también
                     mouth_points_for_mar_detection = [face_landmarks[i] for i in config.MOUTH_INDEXES_FOR_MAR_CALC]
-                    self._draw_mouth_landmarks(frame, mouth_points_to_draw, mouth_points_for_mar_detection) # Llamada modificada
+                    self._draw_mouth_landmarks(frame, mouth_points_to_draw, mouth_points_for_mar_detection)
 
-                except Exception as e: # Capturar cualquier otro error durante el cálculo del MAR
+                except Exception as e:
                     print(f"Error al calcular MAR: {e}")
                     self.yawn_start_time = None
                     self.detection_reliable = False
             else:
-                print("No se detectaron suficientes landmarks para el cálculo del MAR.")
                 self.yawn_start_time = None
                 self.detection_reliable = False
         else:
@@ -83,6 +113,11 @@ class YawnDetector:
         
         if not self.detection_reliable:
             self._draw_alert_message(frame)
+        
+        # Dibujar la alerta de bostezo si está activa
+        if self.alert_active:
+            cv2.putText(frame, "¡ALERTA DE FATIGA!", (50, 280),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
         return frame, self.yawn_counter
 
@@ -103,23 +138,20 @@ class YawnDetector:
                         config.COLOR_MAR,
                         config.FONT_THICKNESS_INFO)
 
-    def _draw_mouth_landmarks(self, frame, mouth_points_all, mouth_points_mar): # Modificado
+    def _draw_mouth_landmarks(self, frame, mouth_points_all, mouth_points_mar):
         """Dibuja círculos en los landmarks de la boca."""
         height, width, _ = frame.shape
-        # Dibuja los contornos completos
         for point in mouth_points_all:
             x, y = int(point.x * width), int(point.y * height)
             cv2.circle(frame, (x, y), config.LANDMARK_DRAW_RADIUS, config.LANDMARK_DRAW_COLOR, -1)
-
-        # Dibuja los puntos de cálculo del MAR con otro color para distinguirlos
         for point in mouth_points_mar:
             x, y = int(point.x * width), int(point.y * height)
-            cv2.circle(frame, (x, y), config.LANDMARK_DRAW_RADIUS, (0, 255, 0), -1) # Verde para MAR
+            cv2.circle(frame, (x, y), config.LANDMARK_DRAW_RADIUS, (0, 255, 0), -1)
     
     def _draw_alert_message(self, frame):
         """Dibuja un mensaje de alerta en el fotograma."""
         cv2.putText(frame, "Asegúrate de que tu boca esté visible y de frente.",
-                    (20, 220), # Ajusta la posición si es necesario
+                    (20, 220),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 0, 255), 2)
 
